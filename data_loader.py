@@ -1,3 +1,4 @@
+import json
 import torch
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
@@ -5,22 +6,55 @@ import pandas as pd
 from typing import List, Dict, Tuple, Optional
 import os
 from pathlib import Path
+from scipy.spatial import KDTree
+
+
+def normalize_biomarker_expression(bm_exp_df):
+    """
+    Normalize biomarker expression table
+
+    Only support arcsinh-zscore pipeline for now
+
+    Args:
+        bm_exp_df (pd.DataFrame): dataframe of raw biomarker expression
+
+    Returns:
+        pd.DataFrame: dataframe of normalized biomarker expression
+    """
+    assert 'CELL_ID' not in bm_exp_df.columns
+    bm_exp_df = np.arcsinh(bm_exp_df / (5 * np.quantile(bm_exp_df, 0.2, axis=0) + 1e-5))
+    bm_exp_df = bm_exp_df / bm_exp_df.std(0)
+    
+    # Clip extreme values to 5
+    bm_exp_df = np.clip(bm_exp_df, 0, 5)
+    
+    # 0-1 normalize the expression intensities
+    # bm_exp_df = bm_exp_df.div((1e-5 + bm_exp_df.sum(axis=1)), axis=0)
+    return bm_exp_df
 
 
 class SpatialBiomarkerDataset(Dataset):
     """
-    Dataset for spatial biomarker data with cell type information
+    Dataset for spatial biomarker data with optional cell type information
     """
 
-    def __init__(self, data_path: str, config):
+    def __init__(self, data_path: str, config, valid_biomarkers: Optional[List[str]] = None):
         self.config = config
         self.regions = []
         self.all_biomarkers = set()
         self.all_cell_types = set()
         self.cell_type_to_idx = {}
+        self.valid_biomarkers = load_biomarker_info_from_csv(config)[0] if \
+            valid_biomarkers is None else valid_biomarkers
+        
+        self.biomarker_rename = json.load(open(config.biomarker_name_mapping_file, 'r'))
+
+        # data_path = os.path.join(data_path, 'train')
 
         self.load_data(data_path)
-        self.build_cell_type_vocab()
+        if self.config.use_cell_types:
+            self.build_cell_type_vocab()
+        self.all_biomarkers = list(self.all_biomarkers)
 
     def load_data(self, data_path: str):
         """
@@ -29,19 +63,19 @@ class SpatialBiomarkerDataset(Dataset):
         data_path/
         ├── study1/
         │   ├── region1/
-        │   │   ├── cell_types.csv
-        │   │   ├── positions.csv
-        │   │   └── biomarkers.csv
+        │   │   ├── cell_data.csv
+        │   │   ├── expression.csv
+        │   │   └── cell_type.csv (optional, for future use)
         │   ├── region2/
-        │   │   ├── cell_types.csv
-        │   │   ├── positions.csv
-        │   │   └── biomarkers.csv
+        │   │   ├── cell_data.csv
+        │   │   ├── expression.csv
+        │   │   └── cell_type.csv (optional, for future use)
         │   └── ...
         ├── study2/
         │   ├── region1/
-        │   │   ├── cell_types.csv
-        │   │   ├── positions.csv
-        │   │   └── biomarkers.csv
+        │   │   ├── cell_data.csv
+        │   │   ├── expression.csv
+        │   │   └── cell_type.csv (optional, for future use)
         │   └── ...
         └── ...
         """
@@ -54,130 +88,144 @@ class SpatialBiomarkerDataset(Dataset):
                     region_path = os.path.join(study_path, region_dir)
                     if os.path.isdir(region_path):
                         try:
-                            region_data = self.load_region_data(region_path, study_dir, region_dir)
+                            region_data = self.load_region_data(region_path)
                             if region_data and len(region_data['coordinates']) >= self.config.min_cells_per_region:
+                                region_data['study_name'] = study_dir
+                                region_data['region_name'] = region_dir
                                 self.regions.append(region_data)
                         except Exception as e:
                             print(f"Error processing region {region_dir} in study {study_dir}: {e}")
 
         print(f"Loaded {len(self.regions)} regions from {data_path}")
         print(f"Found {len(self.all_biomarkers)} unique biomarkers")
-        print(f"Found {len(self.all_cell_types)} unique cell types")
+        if self.config.use_cell_types:
+            print(f"Found {len(self.all_cell_types)} unique cell types")
+        else:
+            print("Cell type loading is disabled")
 
-    def load_region_data(self, region_path: str, study_name: str, region_name: str) -> Optional[Dict]:
+    def load_region_data(self, region_path: str) -> Optional[Dict]:
         """Load and process data for a single region"""
-
-        # Define expected file paths
-        celltype_path = os.path.join(region_path, self.config.celltype_filename)
+        # Define required file paths
         position_path = os.path.join(region_path, self.config.position_filename)
         biomarker_path = os.path.join(region_path, self.config.biomarker_filename)
 
-        # Check if all required files exist
-        required_files = [celltype_path, position_path, biomarker_path]
+        # Cell type file is optional for future use
+        celltype_path = None
+        if self.config.use_cell_types:
+            celltype_path = os.path.join(region_path, self.config.celltype_filename)
+
+        # Check if required files exist
+        required_files = [position_path, biomarker_path]
         for file_path in required_files:
             if not os.path.exists(file_path):
-                print(f"Missing file: {file_path}")
-                return None
+                raise FileNotFoundError(f"Missing required file: {file_path}")
 
-        try:
-            # Load CSV files
-            celltype_df = pd.read_csv(celltype_path)
-            position_df = pd.read_csv(position_path)
-            biomarker_df = pd.read_csv(biomarker_path)
+        # Check optional cell type file
+        celltype_df = None
+        if self.config.use_cell_types and celltype_path and os.path.exists(celltype_path):
+            try:
+                celltype_df = pd.read_csv(celltype_path)
+            except Exception as e:
+                print(f"Warning: Could not load cell type file {celltype_path}: {e}")
+                print("Proceeding without cell type information")
 
-            # Process the data
-            region_data = self.process_region_dataframes(
-                celltype_df, position_df, biomarker_df, study_name, region_name
-            )
+        # Load required CSV files
+        position_df = pd.read_csv(position_path)
+        biomarker_df = pd.read_csv(biomarker_path)
 
-            return region_data
+        # Process the data
+        region_data = self.process_region_dataframes(celltype_df, position_df, biomarker_df)
+        return region_data
 
-        except Exception as e:
-            print(f"Error loading region data from {region_path}: {e}")
-            return None
-
-    def process_region_dataframes(self, celltype_df: pd.DataFrame, position_df: pd.DataFrame,
-                                  biomarker_df: pd.DataFrame, study_name: str, region_name: str) -> Dict:
+    def process_region_dataframes(self,
+                                  celltype_df: Optional[pd.DataFrame],
+                                  position_df: pd.DataFrame,
+                                  biomarker_df: pd.DataFrame) -> Dict:
         """
-        Process the three dataframes into required format
+        Process the dataframes into required format
 
         Expected formats:
-        - celltype_df: columns ['cell_id', 'cell_type']
+        - celltype_df: columns ['cell_id', 'cell_type'] (optional, for future use)
         - position_df: columns ['cell_id', 'x', 'y']
         - biomarker_df: columns ['cell_id', 'biomarker1', 'biomarker2', ...]
         """
 
         # Identify column names (handle variations)
-        celltype_cols = self.identify_celltype_columns(celltype_df)
+        celltype_cols = None
+        if self.config.use_cell_types and celltype_df is not None:
+            celltype_cols = self.identify_celltype_columns(celltype_df)
+
         position_cols = self.identify_position_columns(position_df)
         biomarker_cols = self.identify_biomarker_columns(biomarker_df)
+        if not position_cols:
+            raise ValueError("Could not identify required position columns")
+        if not biomarker_cols:
+            raise ValueError("Could not identify required biomarker columns")
 
-        if not celltype_cols or not position_cols:
-            raise ValueError("Could not identify required columns")
-
-        cell_id_col = celltype_cols['cell_id']
-        celltype_col = celltype_cols['cell_type']
+        # Extract position & biomarker column names
         pos_cell_id_col = position_cols['cell_id']
         x_col = position_cols['x']
         y_col = position_cols['y']
         bio_cell_id_col = biomarker_cols['cell_id']
         biomarker_features = biomarker_cols['biomarkers']
+        assert position_df[pos_cell_id_col].is_unique
+        assert position_df[pos_cell_id_col].tolist() == biomarker_df[bio_cell_id_col].tolist()
 
-        # Merge dataframes on cell_id
-        merged_df = celltype_df.merge(position_df, left_on=cell_id_col, right_on=pos_cell_id_col, how='inner')
-        merged_df = merged_df.merge(biomarker_df, left_on=cell_id_col, right_on=bio_cell_id_col, how='inner')
+        # Extract cell type columns (for future use)
+        cell_id_col = None
+        celltype_col = None
+        if celltype_cols:
+            cell_id_col = celltype_cols['cell_id']
+            celltype_col = celltype_cols['cell_type']
+            assert position_df[pos_cell_id_col].tolist() == celltype_df[cell_id_col].tolist()
 
-        # Prepare output data
-        coordinates = []
-        cell_types = []
-        biomarkers = []
-        intensities = []
+        # Extract biomarker expression matrix (exclude cell_id column)
+        if self.valid_biomarkers:
+            excluded = set()
+            for bm in biomarker_features:
+                if bm not in self.valid_biomarkers:
+                    if bm not in self.biomarker_rename:
+                        excluded.add(bm)
+                    else:
+                        # Some are renamed to EMPTY or invalid 
+                        if self.biomarker_rename[bm] not in self.valid_biomarkers:
+                            excluded.add(bm)
 
-        for _, row in merged_df.iterrows():
-            # Get coordinates
-            x_coord = float(row[x_col])
-            y_coord = float(row[y_col])
-            coordinates.append((x_coord, y_coord))
+            if excluded:
+                print(f"Excluding biomarkers: {excluded}")
+            biomarker_features = [b for b in biomarker_features if b not in excluded]
+        biomarker_expression_df = biomarker_df[biomarker_features].copy()
+        biomarker_expression_df = normalize_biomarker_expression(biomarker_expression_df)
 
-            # Get cell type
-            cell_type = str(row[celltype_col])
-            cell_types.append(cell_type)
-            self.all_cell_types.add(cell_type)
-
-            # Get biomarker data
-            cell_biomarkers = []
-            cell_intensities = []
-
-            for biomarker in biomarker_features:
-                if biomarker in row and pd.notna(row[biomarker]):
-                    intensity = float(row[biomarker])
-                    if intensity > 0:  # Only include positive intensities
-                        cell_biomarkers.append(biomarker)
-                        cell_intensities.append(intensity)
-                        self.all_biomarkers.add(biomarker)
-
-            if len(cell_biomarkers) >= self.config.min_biomarkers_per_cell:
-                biomarkers.append(cell_biomarkers)
-                intensities.append(cell_intensities)
-            else:
-                # Remove corresponding entries if cell doesn't meet criteria
-                coordinates.pop()
-                cell_types.pop()
-
-        return {
-            'coordinates': coordinates,
-            'cell_types': cell_types,
-            'biomarkers': biomarkers,
-            'intensities': intensities,
-            'study_name': study_name,
-            'region_name': region_name,
-            'num_cells': len(coordinates)
+        # Compose region data
+        region_data = {
+            'coordinates': np.array(position_df[[x_col, y_col]]),
+            'intensities': np.array(biomarker_expression_df),
+            'cell_ids': position_df[pos_cell_id_col].tolist(),
+            'biomarkers': [
+                bm if bm in self.valid_biomarkers else self.biomarker_rename[bm]
+                for bm in biomarker_features
+            ],
+            'cell_types': [] if celltype_col is None else celltype_df[celltype_col].tolist(),
+            'num_cells': position_df.shape[0],
         }
+        assert region_data['coordinates'].shape == (region_data['num_cells'], 2)
+        assert region_data['intensities'].shape == (region_data['num_cells'], len(biomarker_features))
+        assert len(region_data['cell_ids']) == region_data['num_cells']
+        region_data['kdtree'] = KDTree(region_data['coordinates'])
+        
+        self.all_biomarkers.update(region_data['biomarkers'])
+        self.all_cell_types.update(region_data['cell_types'])
+        return region_data
 
     def identify_celltype_columns(self, df: pd.DataFrame) -> Dict[str, str]:
         """Identify cell type and cell ID columns"""
-        cell_id_candidates = ['cell_id', 'cellid', 'id', 'cell', 'Cell_ID', 'CellID']
-        celltype_candidates = ['cell_type', 'celltype', 'type', 'Cell_Type', 'CellType', 'cell_class', 'class']
+        cell_id_candidates = ['cell_id', 'cellid', 'id', 'cell', 'Cell_ID', 'CellID', 'CELL_ID']
+        celltype_candidates = [
+            'cell_type', 'celltype', 'type', 'Cell_Type', 'CellType', 
+            'cell_class', 'class', 'ANNOTATION_LABEL', 'annotation_label',
+            'label', 'Label', 'LABEL'  # Add more variations
+        ]
 
         cell_id_col = None
         celltype_col = None
@@ -192,7 +240,9 @@ class SpatialBiomarkerDataset(Dataset):
         # Find cell type column
         for col in df.columns:
             if col in celltype_candidates or any(
-                    candidate.lower() in col.lower() for candidate in ['cell_type', 'celltype', 'type']):
+                    candidate.lower() in col.lower() for candidate in [
+                        'cell_type', 'celltype', 'type', 'annotation', 'label'
+                    ]):
                 celltype_col = col
                 break
 
@@ -248,14 +298,32 @@ class SpatialBiomarkerDataset(Dataset):
         return {'cell_id': cell_id_col, 'biomarkers': biomarker_cols}
 
     def build_cell_type_vocab(self):
-        """Build cell type vocabulary"""
-        unique_cell_types = sorted(list(self.all_cell_types))
-        self.cell_type_to_idx = {cell_type: idx for idx, cell_type in enumerate(unique_cell_types)}
+        """Build cell type vocabulary with unknown class as index 0"""
+        # unique_cell_types = sorted(list(self.all_cell_types))
+        unique_cell_types = sorted(list(set(str(ct) for ct in self.all_cell_types)))
+
+        # Always put unknown class at index 0
+        self.cell_type_to_idx = {"unknown": 0}
+
+        # Add all other cell types starting from index 1
+        for idx, cell_type in enumerate(unique_cell_types, start=1):
+            if cell_type != "unknown":  # Avoid duplicate if "unknown" already exists
+                self.cell_type_to_idx[cell_type] = idx
+
         self.idx_to_cell_type = {idx: cell_type for cell_type, idx in self.cell_type_to_idx.items()}
 
     def get_cell_type_index(self, cell_type: str) -> int:
-        """Get index for cell type"""
+        """Get index for cell type (for future use)"""
         return self.cell_type_to_idx.get(cell_type, 0)  # Default to 0 if unknown
+
+    def get_cell_type_name(self, idx: int) -> str:
+        """Get cell type name from index"""
+        return self.idx_to_cell_type.get(idx, "unknown")
+
+    def get_cell_type_vocab_size(self) -> int:
+        if not self.config.use_cell_types:
+            return 0
+        return len(self.cell_type_to_idx)
 
     def __len__(self):
         return len(self.regions)
@@ -264,7 +332,7 @@ class SpatialBiomarkerDataset(Dataset):
         return self.regions[idx]
 
     def get_all_biomarkers(self) -> List[str]:
-        return list(self.all_biomarkers)
+        return self.all_biomarkers
 
     def get_all_cell_types(self) -> List[str]:
         return list(self.all_cell_types)
@@ -282,84 +350,86 @@ class SpatialBiomarkerDataset(Dataset):
             study = region['study_name']
             study_counts[study] = study_counts.get(study, 0) + 1
 
-            for cell_type in region['cell_types']:
-                cell_type_counts[cell_type] = cell_type_counts.get(cell_type, 0) + 1
+            if self.config.use_cell_types:
+                for cell_type in region['cell_types']:
+                    cell_type_counts[cell_type] = cell_type_counts.get(cell_type, 0) + 1
 
-        return {
+        stats = {
             'total_regions': len(self.regions),
             'total_biomarkers': len(self.all_biomarkers),
-            'total_cell_types': len(self.all_cell_types),
             'mean_cells_per_region': np.mean(num_cells_per_region),
             'std_cells_per_region': np.std(num_cells_per_region),
             'min_cells_per_region': np.min(num_cells_per_region),
             'max_cells_per_region': np.max(num_cells_per_region),
             'studies': study_counts,
-            'cell_type_distribution': cell_type_counts,
-            'biomarkers': sorted(list(self.all_biomarkers)),
-            'cell_types': sorted(list(self.all_cell_types))
+            'biomarkers': sorted(list(self.all_biomarkers))
         }
 
+        if self.config.use_cell_types:
+            stats.update({
+                'total_cell_types': len(self.all_cell_types),
+                'cell_type_distribution': cell_type_counts,
+                'cell_types': sorted(list(self.all_cell_types))
+            })
+        else:
+            stats.update({
+                'total_cell_types': 1,  # Only "unknown" cell type
+                'cell_type_distribution': {'unknown': sum(len(region['cell_types']) for region in self.regions)},
+                'cell_types': ['unknown']
+            })
 
-def create_data_loaders(config):
-    """Create training and validation data loaders"""
-
-    # Load datasets
-    train_dataset = SpatialBiomarkerDataset(
-        os.path.join(config.data_path, 'train'), config
-    )
-    val_dataset = SpatialBiomarkerDataset(
-        os.path.join(config.data_path, 'val'), config
-    )
-
-    # Ensure consistent vocabularies
-    all_biomarkers = list(set(train_dataset.get_all_biomarkers() + val_dataset.get_all_biomarkers()))
-    all_cell_types = list(set(train_dataset.get_all_cell_types() + val_dataset.get_all_cell_types()))
-
-    # Update vocabularies in both datasets
-    cell_type_to_idx = {cell_type: idx for idx, cell_type in enumerate(sorted(all_cell_types))}
-    train_dataset.cell_type_to_idx = cell_type_to_idx
-    val_dataset.cell_type_to_idx = cell_type_to_idx
-    train_dataset.all_cell_types = set(all_cell_types)
-    val_dataset.all_cell_types = set(all_cell_types)
-
-    # Print dataset statistics
-    print("Training Dataset Statistics:")
-    train_stats = train_dataset.get_dataset_statistics()
-    for key, value in train_stats.items():
-        if key not in ['biomarkers', 'cell_types']:
-            print(f"  {key}: {value}")
-
-    print("\nValidation Dataset Statistics:")
-    val_stats = val_dataset.get_dataset_statistics()
-    for key, value in val_stats.items():
-        if key not in ['biomarkers', 'cell_types']:
-            print(f"  {key}: {value}")
-
-    print(f"\nTotal unique biomarkers: {len(all_biomarkers)}")
-    print(f"Total unique cell types: {len(all_cell_types)}")
-
-    # Custom collate function
-    def collate_fn(batch):
-        return batch
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
-        collate_fn=collate_fn,
-        num_workers=0
-    )
-
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config.batch_size,
-        shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=0
+        return stats
 
 
+def load_biomarker_info_from_csv(config):
+    """
+    Load biomarker information from CSV file and return valid biomarkers list.
+    """
+    biomarker_info = {}
+    valid_biomarkers = []
 
+    filepath = config.biomarker_sequence_file
 
-    )
+    try:
+        df = pd.read_csv(filepath)
 
-    return train_loader, val_loader, all_biomarkers, len(all_cell_types)
+        # Skip header row and process data
+        for _, row in df.iterrows():
+            biomarker_name = str(row.iloc[0]).strip()
+            amino_acid_seq = row.iloc[1]
+
+            # Check if biomarker is legitimate
+            if pd.isna(amino_acid_seq):
+                # Legit biomarker but no sequence
+                biomarker_info[biomarker_name] = {
+                    'type': 'legit_no_sequence',
+                    'sequence': None
+                }
+                valid_biomarkers.append(biomarker_name)
+            elif str(amino_acid_seq).upper() == 'N/A':
+                # Not a legitimate biomarker
+                biomarker_info[biomarker_name] = {
+                    'type': 'not_legit',
+                    'sequence': None
+                }
+                # Don't add to valid_biomarkers
+            else:
+                # Has amino acid sequence
+                biomarker_info[biomarker_name] = {
+                    'type': 'has_sequence',
+                    'sequence': str(amino_acid_seq).strip()
+                }
+                valid_biomarkers.append(biomarker_name)
+
+        print(f"Loaded biomarker info from {filepath}")
+        print(f"  - Valid biomarkers: {len(valid_biomarkers)}")
+        print(f"  - Invalid biomarkers: {len(biomarker_info) - len(valid_biomarkers)}")
+
+    except FileNotFoundError:
+        print(f"ERROR: The file '{filepath}' was not found.")
+        return [], {}
+    except Exception as e:
+        print(f"ERROR loading biomarker info: {e}")
+        return [], {}
+
+    return valid_biomarkers, biomarker_info

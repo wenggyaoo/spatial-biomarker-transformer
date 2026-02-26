@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+from scipy.stats import rankdata
 from typing import List, Tuple, Dict, Optional
 from config import Config
 
@@ -7,69 +8,75 @@ from config import Config
 class IntensityMasker:
     """
     Handles intensity-level masking for center cells and neighboring cells separately
+    
+    This class does not perform any kind of normalization on the masked/visible intensities.
     """
 
     def __init__(self, config: Config):
         self.config = config
 
-    def apply_center_intensity_masking(self,
-                                       center_biomarkers: List[str],
-                                       center_intensities: List[float]) -> Tuple[List[float], List[int], List[float]]:
+    def mask_sample(self, sample_data):
+        center_intensities = sample_data['intensities'][0:1]  # (1, num_biomarkers)
+        neighbor_intensities = sample_data['intensities'][1:]  # (num_neighbors, num_biomarkers)
+        
+        center_masked, center_mask_flag = self.apply_center_intensity_masking(center_intensities)  # (1, num_biomarkers)
+        neighbor_masked, neighbor_mask_flag = self.apply_neighbor_intensity_masking(neighbor_intensities)  # (num_neighbors, num_biomarkers)
+        
+        masked_items = {sample_data['biomarkers'][i]: center_intensities[0, i]
+                        for i in range(len(sample_data['biomarkers'])) if center_mask_flag[0, i] == 1}
+        
+        sample_data['masked_intensities'] = np.concatenate([center_masked, neighbor_masked], 0)
+        sample_data['mask_flags'] = np.concatenate([center_mask_flag, neighbor_mask_flag], 0)
+        sample_data['masked_items'] = masked_items        
+        return sample_data
+
+    def apply_center_intensity_masking(self, center_intensities):
         """
         Apply intensity masking to center cell
 
         Args:
-            center_biomarkers: List of biomarker names for center cell
-            center_intensities: List of intensity values for center cell
+            center_intensities: 2d numpy array of biomarker intensities, (1, num_biomarkers)
 
         Returns:
             masked_intensities: Intensities with some values masked
             mask_indices: Indices of masked positions
             original_intensities: Original intensity values
         """
+        assert center_intensities.ndim == 2 and center_intensities.shape[0] == 1
+        if center_intensities.shape[1] == 0:
+            raise ValueError("Center cell has no intensities")
+
         if not self.config.enable_center_intensity_masking:
-            return center_intensities.copy(), [], center_intensities.copy()
+            return center_intensities, np.zeros_like(center_intensities)
 
-        if len(center_intensities) == 0:
-            return [], [], []
-
-        # Decide whether to apply masking based on probability
         if np.random.random() > self.config.center_intensity_mask_probability:
-            return center_intensities.copy(), [], center_intensities.copy()
+            return center_intensities, np.zeros_like(center_intensities)
 
         # Determine number of intensities to mask
-        min_mask = max(1, int(len(center_intensities) * self.config.center_intensity_min_mask_ratio))
-        max_mask = min(len(center_intensities),
-                       int(len(center_intensities) * self.config.center_intensity_max_mask_ratio))
-        num_to_mask = np.random.randint(min_mask, max_mask + 1)
+        num_biomarkers = center_intensities.shape[1]
+        min_mask = max(1, int(num_biomarkers * self.config.center_intensity_min_mask_ratio))
+        max_mask = min(num_biomarkers, int(num_biomarkers * self.config.center_intensity_max_mask_ratio))
+        num_to_mask = np.random.randint(min_mask, max_mask + 1, (1,))
 
         # Preserve top biomarkers if specified
-        protected_indices = set()
+        protected_mask = np.zeros_like(center_intensities, dtype=int)
         if self.config.preserve_top_biomarkers > 0:
-            # Get indices of top biomarkers by intensity
-            intensity_array = np.array(center_intensities)
-            top_indices = np.argsort(intensity_array)[-self.config.preserve_top_biomarkers:]
-            protected_indices = set(top_indices.tolist())
+            protected_mask = self._select_masks(
+                center_intensities, np.array([self.config.preserve_top_biomarkers]),
+                'highest', np.zeros_like(center_intensities))
 
         # Select indices to mask based on strategy
-        mask_indices = self._select_mask_indices(
+        mask_flag = self._select_masks(
             center_intensities,
             num_to_mask,
             self.config.center_mask_strategy,
-            protected_indices
-        )
+            protected_mask)
 
         # Apply masking
-        masked_intensities = center_intensities.copy()
-        for idx in mask_indices:
-            masked_intensities[idx] = self.config.center_intensity_mask_value
+        masked_intensities = center_intensities * (1 - mask_flag)
+        return masked_intensities, mask_flag
 
-        return masked_intensities, mask_indices, center_intensities.copy()
-
-    def apply_neighbor_intensity_masking(self,
-                                         neighbor_biomarkers: List[List[str]],
-                                         neighbor_intensities: List[List[float]]) -> Tuple[
-        List[List[float]], List[List[int]], List[List[float]]]:
+    def apply_neighbor_intensity_masking(self, neighbor_intensities):
         """
         Apply intensity masking to neighbor cells
 
@@ -83,145 +90,87 @@ class IntensityMasker:
             original_intensities: Original intensity values for each neighbor
         """
         if not self.config.enable_neighbor_intensity_masking:
-            return [intensities.copy() for intensities in neighbor_intensities], \
-                [[] for _ in neighbor_intensities], \
-                [intensities.copy() for intensities in neighbor_intensities]
+            return neighbor_intensities, np.zeros_like(neighbor_intensities)
 
-        masked_intensities = []
-        all_mask_indices = []
-        original_intensities = [intensities.copy() for intensities in neighbor_intensities]
+        # Determine number of intensities to mask for each neighbor
+        n_neighbors, num_biomarkers = neighbor_intensities.shape
+        min_mask = max(1, int(num_biomarkers * self.config.neighbor_intensity_min_mask_ratio))
+        max_mask = min(num_biomarkers, int(num_biomarkers * self.config.neighbor_intensity_max_mask_ratio))
+        num_to_mask = np.random.randint(min_mask, max_mask + 1, (n_neighbors,))
+        num_to_mask = np.where(np.random.rand(n_neighbors) < self.config.neighbor_intensity_mask_probability, num_to_mask, 0)            
 
-        for neighbor_idx, intensities in enumerate(neighbor_intensities):
-            if len(intensities) == 0:
-                masked_intensities.append([])
-                all_mask_indices.append([])
-                continue
+        # Select indices to mask
+        mask_flag = self._select_masks(
+            neighbor_intensities,
+            num_to_mask,
+            self.config.neighbor_mask_strategy,
+            np.zeros_like(neighbor_intensities, dtype=bool))
 
-            # Decide whether to apply masking based on probability
-            if np.random.random() > self.config.neighbor_intensity_mask_probability:
-                masked_intensities.append(intensities.copy())
-                all_mask_indices.append([])
-                continue
+        # Apply masking
+        masked_intensities = neighbor_intensities * (1 - mask_flag)
+        return masked_intensities, mask_flag
 
-            # Determine number of intensities to mask
-            min_mask = max(1, int(len(intensities) * self.config.neighbor_intensity_min_mask_ratio))
-            max_mask = min(len(intensities), int(len(intensities) * self.config.neighbor_intensity_max_mask_ratio))
-            num_to_mask = np.random.randint(min_mask, max_mask + 1)
-
-            # Select indices to mask
-            mask_indices = self._select_mask_indices(
-                intensities,
-                num_to_mask,
-                self.config.neighbor_mask_strategy,
-                set()  # No protected indices for neighbors
-            )
-
-            # Apply masking
-            neighbor_masked = intensities.copy()
-            for idx in mask_indices:
-                neighbor_masked[idx] = self.config.neighbor_intensity_mask_value
-
-            masked_intensities.append(neighbor_masked)
-            all_mask_indices.append(mask_indices)
-
-        return masked_intensities, all_mask_indices, original_intensities
-
-    def _select_mask_indices(self,
-                             intensities: List[float],
-                             num_to_mask: int,
-                             strategy: str,
-                             protected_indices: set) -> List[int]:
+    def _select_masks(self,
+                      intensities: np.ndarray,
+                      num_to_mask: np.ndarray,
+                      strategy: str,
+                      protected_mask: np.ndarray) -> np.ndarray:
         """
         Select indices to mask based on strategy
+        
+        Args:
+            intensities: 2d numpy array of biomarker intensities: (num_cells, num_biomarkers)
+            num_to_mask: 1d numpy array of number of intensities to mask for each cell: (num_cells,)
+            strategy: Masking strategy ('random', 'highest', 'lowest', 'middle')
+            protected_mask: 2d numpy array indicating protected positions: (num_cells, num_biomarkers),
+                1 for protected, 0 for available
         """
-        available_indices = [i for i in range(len(intensities)) if i not in protected_indices]
+        assert intensities.ndim == 2
+        assert intensities.shape == protected_mask.shape
+        assert num_to_mask.ndim == 1 and num_to_mask.shape[0] == intensities.shape[0]
+        available_mask = 1 - (protected_mask * 1)  # 1 for available, 0 for protected
 
-        if len(available_indices) == 0:
-            return []
-
-        if num_to_mask >= len(available_indices):
-            return available_indices
-
-        intensity_array = np.array([intensities[i] for i in available_indices])
+        if np.sum(available_mask) == 0 or np.sum(num_to_mask) == 0:
+            return np.zeros_like(intensities, dtype=int)
 
         if strategy == 'random':
-            selected_available = np.random.choice(available_indices, num_to_mask, replace=False)
-            return selected_available.tolist()
+            # Generate random values for all available positions
+            random_values = np.random.rand(*intensities.shape)
+            # Set random values for protected positions to +inf (to exclude them)
+            random_values = np.where(available_mask, random_values, np.inf)
+            # Rank each row and select top `num_to_mask` positions per row
+            random_ranks = rankdata(random_values, axis=1)
+            selected_mask = (random_ranks <= num_to_mask[:, None]).astype(int)
 
         elif strategy == 'highest':
-            # Mask highest intensity values
-            sorted_indices = np.argsort(intensity_array)[::-1]  # Descending order
-            selected_available_idx = sorted_indices[:num_to_mask]
-            return [available_indices[i] for i in selected_available_idx]
+            # Set protected positions to -inf (to exclude them)
+            _intensities = np.where(intensities == intensities, intensities, -np.inf)  # Replace NaN with -inf
+            _intensities = np.where(available_mask, _intensities, -np.inf)
+            # Rank in descending order
+            ranks = rankdata(-_intensities, axis=1)
+            selected_mask = (ranks <= num_to_mask[:, None]).astype(int)
 
         elif strategy == 'lowest':
-            # Mask lowest intensity values
-            sorted_indices = np.argsort(intensity_array)  # Ascending order
-            selected_available_idx = sorted_indices[:num_to_mask]
-            return [available_indices[i] for i in selected_available_idx]
+            # Set protected positions to +inf (to exclude them)
+            _intensities = np.where(intensities == intensities, intensities, np.inf)  # Replace NaN with +inf
+            _intensities = np.where(available_mask, _intensities, np.inf)
+            # Rank in ascending order
+            ranks = rankdata(_intensities, axis=1)
+            selected_mask = (ranks <= num_to_mask[:, None]).astype(int)
 
         elif strategy == 'middle':
-            # Mask middle-range intensity values
-            sorted_indices = np.argsort(intensity_array)
-            start_idx = max(0, len(sorted_indices) // 4)
-            end_idx = min(len(sorted_indices), 3 * len(sorted_indices) // 4)
-            middle_indices = sorted_indices[start_idx:end_idx]
-
-            if len(middle_indices) < num_to_mask:
-                # Fall back to random if not enough middle values
-                selected_available = np.random.choice(available_indices, num_to_mask, replace=False)
-                return selected_available.tolist()
-            else:
-                selected_middle = np.random.choice(middle_indices, num_to_mask, replace=False)
-                return [available_indices[i] for i in selected_middle]
+            medians = np.nanmedian(intensities, axis=1, keepdims=True)
+            # Set protected positions to median
+            _intensities = np.where(intensities == intensities, intensities, np.Inf)
+            _intensities = np.where(available_mask, _intensities, np.Inf)
+            # Compute absolute differences from the median
+            deviations = np.abs(_intensities - medians)
+            ranks = rankdata(deviations, axis=1)
+            selected_mask = (ranks <= num_to_mask[:, None]).astype(int)
 
         else:
-            # Default to random
-            selected_available = np.random.choice(available_indices, num_to_mask, replace=False)
-            return selected_available.tolist()
+            raise ValueError(f"Unknown strategy: {strategy}")
 
-    def get_masking_statistics(self, mask_info: Dict) -> Dict:
-        """Calculate statistics about the applied masking"""
-        stats = {
-            'center_cells_masked': 0,
-            'center_intensities_masked': 0,
-            'center_total_intensities': 0,
-            'neighbor_cells_masked': 0,
-            'neighbor_intensities_masked': 0,
-            'neighbor_total_intensities': 0,
-            'center_mask_ratio': 0.0,
-            'neighbor_mask_ratio': 0.0
-        }
-
-        if 'center_mask_indices' in mask_info:
-            center_masks = mask_info['center_mask_indices']
-            for mask_indices in center_masks:
-                if len(mask_indices) > 0:
-                    stats['center_cells_masked'] += 1
-                    stats['center_intensities_masked'] += len(mask_indices)
-
-        if 'center_original_intensities' in mask_info:
-            for intensities in mask_info['center_original_intensities']:
-                stats['center_total_intensities'] += len(intensities)
-
-        if 'neighbor_mask_indices' in mask_info:
-            neighbor_masks = mask_info['neighbor_mask_indices']
-            for cell_masks in neighbor_masks:
-                for mask_indices in cell_masks:
-                    if len(mask_indices) > 0:
-                        stats['neighbor_cells_masked'] += 1
-                        stats['neighbor_intensities_masked'] += len(mask_indices)
-
-        if 'neighbor_original_intensities' in mask_info:
-            for cell_intensities in mask_info['neighbor_original_intensities']:
-                for intensities in cell_intensities:
-                    stats['neighbor_total_intensities'] += len(intensities)
-
-        # Calculate ratios
-        if stats['center_total_intensities'] > 0:
-            stats['center_mask_ratio'] = stats['center_intensities_masked'] / stats['center_total_intensities']
-
-        if stats['neighbor_total_intensities'] > 0:
-            stats['neighbor_mask_ratio'] = stats['neighbor_intensities_masked'] / stats['neighbor_total_intensities']
-
-        return stats
+        # Ensure only available positions are masked
+        selected_mask = ((selected_mask * available_mask) > 0).astype(int)
+        return selected_mask

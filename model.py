@@ -1,8 +1,9 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from typing import Optional, Tuple, Dict, List
 from intensity_masker import IntensityMasker
+from esm_embedder import BiomarkerEmbedder
+from positional_embedding import SinusoidalRotationalEmbedding, SinusoidalSpatialEmbedding
+import numpy as np
 
 
 class SpatialBiomarkerTransformer(nn.Module):
@@ -10,24 +11,39 @@ class SpatialBiomarkerTransformer(nn.Module):
     Main transformer model for spatial biomarker analysis with intensity-level masking
     """
 
-    def __init__(self, config, biomarker_embedder, num_cell_types):
+    def __init__(self,
+                 config,
+                 biomarker_embedder=None,
+                 intensity_masker=None,
+                 is_teacher_model=False):
         super().__init__()
         self.config = config
+        self.is_teacher_model = is_teacher_model
+        self.masking = not is_teacher_model
+        
+        # Biomarker embedder
         self.biomarker_embedder = biomarker_embedder
-        self.num_cell_types = num_cell_types
+        assert self.biomarker_embedder is not None, "Biomarker embedder must be provided"
+        assert self.biomarker_embedder.embedding_dim is not None, "Biomarker embedder is not initialized"
+        self.biomarker_dim = self.biomarker_embedder.embedding_dim
 
         # Initialize intensity masker
-        self.intensity_masker = IntensityMasker(config)
+        self.intensity_masker = IntensityMasker(config) if intensity_masker is None else intensity_masker
 
-        # Get embedding dimension from embedder
-        self.biomarker_dim = biomarker_embedder.get_embedding_dim()
+        self.input_norm = nn.LayerNorm(config.d_model)
 
         # Projection layer to map embedder output to model dimension
-        self.embedder_projection = nn.Linear(self.biomarker_dim, config.d_model)
+        self.embedder_projection = nn.Sequential(
+            nn.Linear(self.biomarker_dim, config.d_model),
+            nn.ReLU(),
+            nn.Dropout(config.dropout),
+        )
 
         # Positional embedding
-        from positional_embedding import SpatialPositionalEmbedding
-        self.pos_embedding = SpatialPositionalEmbedding(config.d_model)
+        if config.positional_embedder == "rotational":
+            self.pos_embedding = SinusoidalRotationalEmbedding(config.d_model)
+        else:
+            self.pos_embedding = SinusoidalSpatialEmbedding(config.d_model)
 
         # Transformer layers
         encoder_layer = nn.TransformerEncoderLayer(
@@ -39,222 +55,215 @@ class SpatialBiomarkerTransformer(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=config.num_encoder_layers)
 
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=config.d_model,
-            nhead=config.nhead,
-            dim_feedforward=config.dim_feedforward,
-            dropout=config.dropout,
-            batch_first=True
-        )
-        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=config.num_decoder_layers)
-
-        # Task-specific heads
-        self.mask_prediction_head = nn.Sequential(
-            nn.Linear(config.d_model, config.dim_feedforward),
-            nn.ReLU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(config.dim_feedforward, self.biomarker_dim)
-        )
-
-        self.celltype_classifier = nn.Sequential(
-            nn.Linear(config.d_model, config.dim_feedforward),
-            nn.ReLU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(config.dim_feedforward, num_cell_types)
-        )
-
         self.reconstruction_head = nn.Sequential(
-            nn.Linear(config.d_model, config.dim_feedforward),
+            nn.LayerNorm(config.d_model + self.biomarker_dim),
+            nn.Linear(config.d_model + self.biomarker_dim, 1024),  # Note: d_model + biomarker_dim
             nn.ReLU(),
             nn.Dropout(config.dropout),
-            nn.Linear(config.dim_feedforward, self.biomarker_dim)
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(512, 1)
         )
 
-        # Learnable query for center cell reconstruction
-        self.center_query = nn.Parameter(torch.randn(1, 1, config.d_model))
+        self.initialize_weights()
 
-    def create_embeddings_with_masking(self, batch_data, cell_type_to_idx):
+    def initialize_weights(self):
+        """Proper weight initialization to prevent gradient explosion"""
+        for layer in self.embedder_projection:
+            if isinstance(layer, nn.Linear):
+                # Xavier/Glorot initialization with smaller scale
+
+                # nn.init.xavier_normal_(layer.weight, gain=0.1)  # Smaller gain
+                nn.init.xavier_normal_(layer.weight, gain=nn.init.calculate_gain('relu'))
+
+                if layer.bias is not None:
+                    nn.init.constant_(layer.bias, 0.0)
+
+        for layer in self.reconstruction_head:
+            if isinstance(layer, nn.Linear):
+                # Xavier/Glorot initialization with smaller scale
+
+                # nn.init.xavier_normal_(layer.weight, gain=0.1)  # Smaller gain
+                nn.init.xavier_normal_(layer.weight, gain=nn.init.calculate_gain('relu'))
+
+                if layer.bias is not None:
+                    nn.init.constant_(layer.bias, 0.0)
+
+        # Initialize transformer layers more conservatively
+        for name, param in self.encoder.named_parameters():
+            if 'weight' in name and param.dim() > 1:
+                nn.init.xavier_normal_(param, gain=0.1)
+            elif 'bias' in name:
+                nn.init.constant_(param, 0.0)
+
+    def create_embeddings(self, batch_data):
         """
         Create embeddings for a batch with intensity-level masking applied
         """
+        device = self.config.device
         batch_size = len(batch_data)
         max_seq_len = max(len(region['coordinates']) for region in batch_data)
 
-        # Original embeddings (without masking)
-        original_embeddings = torch.zeros(batch_size, max_seq_len, self.biomarker_dim,
-                                          device=self.config.device)
+        # Original & masked embeddings, coordinates (for positional encoding calculation), and padding masks
+        embeddings = torch.zeros(batch_size, max_seq_len, self.biomarker_dim, device=device)
+        coordinates = torch.zeros(batch_size, max_seq_len, 2, device=device)
+        pad_mask = torch.zeros(batch_size, max_seq_len, dtype=torch.bool, device=device)
 
-        # Masked embeddings (with intensity masking applied)
-        masked_embeddings = torch.zeros(batch_size, max_seq_len, self.biomarker_dim,
-                                        device=self.config.device)
+        masked_biomarker_expression = []
 
-        coordinates = torch.zeros(batch_size, max_seq_len, 2, device=self.config.device)
-        attention_mask = torch.zeros(batch_size, max_seq_len, dtype=torch.bool,
-                                     device=self.config.device)
-        cell_type_labels = torch.zeros(batch_size, dtype=torch.long, device=self.config.device)
+        for i, sample in enumerate(batch_data):
+            # Mark padding positions
+            seq_len = len(sample['coordinates'])
+            pad_mask[i, seq_len:] = True
 
-        # Store masking information
-        mask_info = {
-            'center_mask_indices': [],
-            'center_original_intensities': [],
-            'center_masked_intensities': [],
-            'neighbor_mask_indices': [],
-            'neighbor_original_intensities': [],
-            'neighbor_masked_intensities': []
-        }
+            # Populate coordinates and original embeddings
+            biomarkers = sample['biomarkers']
+            coordinates[i, :seq_len] = torch.tensor(sample['coordinates'], dtype=torch.float32, device=device)
 
-        for i, region in enumerate(batch_data):
-            seq_len = len(region['coordinates'])
+            if self.masking:
+                masked_sample = self.intensity_masker.mask_sample(sample)
+                masked_intensities = masked_sample['masked_intensities']
+                if self.config.normalize_masked_expression:
+                    masked_intensities = self._renormalize_intensities(masked_intensities)
+                embeddings[i, :seq_len] = self.biomarker_embedder(biomarkers, masked_intensities)
 
-            # Process center cell (index 0)
-            center_biomarkers = region['biomarkers'][0]
-            center_intensities = region['intensities'][0]
+                # Extract masked center cell biomarker expression
+                masked_biomarker_expression.append(masked_sample['masked_items'])
+            else:
+                embeddings[i, :seq_len] = self.biomarker_embedder(biomarkers, sample['intensities'])
 
-            # Apply center cell masking
-            center_masked_intensities, center_mask_indices, center_original = self.intensity_masker.apply_center_intensity_masking(
-                center_biomarkers, center_intensities
-            )
+        return embeddings, coordinates, pad_mask, masked_biomarker_expression
 
-            # Store center masking info
-            mask_info['center_mask_indices'].append(center_mask_indices)
-            mask_info['center_original_intensities'].append(center_original)
-            mask_info['center_masked_intensities'].append(center_masked_intensities)
+    def _renormalize_intensities(self, masked_intensities):
+        """
+        Rescale masked intensities to maintain the same sum as original intensities
+        """
+        raise NotImplementedError("Renormalization not implemented yet")
 
-            # Create embeddings for center cell
-            center_original_tensor = torch.tensor(center_original, dtype=torch.float32, device=self.config.device)
-            center_masked_tensor = torch.tensor(center_masked_intensities, dtype=torch.float32,
-                                                device=self.config.device)
-
-            original_embeddings[i, 0] = self.biomarker_embedder(center_biomarkers, center_original_tensor)
-            masked_embeddings[i, 0] = self.biomarker_embedder(center_biomarkers, center_masked_tensor)
-
-            # Process neighbor cells
-            neighbor_biomarkers = region['biomarkers'][1:seq_len]
-            neighbor_intensities = region['intensities'][1:seq_len]
-
-            # Apply neighbor masking
-            neighbor_masked_intensities, neighbor_mask_indices, neighbor_original = self.intensity_masker.apply_neighbor_intensity_masking(
-                neighbor_biomarkers, neighbor_intensities
-            )
-
-            # Store neighbor masking info
-            mask_info['neighbor_mask_indices'].append(neighbor_mask_indices)
-            mask_info['neighbor_original_intensities'].append(neighbor_original)
-            mask_info['neighbor_masked_intensities'].append(neighbor_masked_intensities)
-
-            # Create embeddings for neighbors
-            for j, (biomarkers, original_ints, masked_ints) in enumerate(
-                    zip(neighbor_biomarkers, neighbor_original, neighbor_masked_intensities)):
-                cell_idx = j + 1  # Offset by 1 since center is at index 0
-
-                original_tensor = torch.tensor(original_ints, dtype=torch.float32, device=self.config.device)
-                masked_tensor = torch.tensor(masked_ints, dtype=torch.float32, device=self.config.device)
-
-                original_embeddings[i, cell_idx] = self.biomarker_embedder(biomarkers, original_tensor)
-                masked_embeddings[i, cell_idx] = self.biomarker_embedder(biomarkers, masked_tensor)
-
-            # Store coordinates
-            coords_tensor = torch.tensor(region['coordinates'], dtype=torch.float32, device=self.config.device)
-            coordinates[i, :seq_len] = coords_tensor
-
-            # Create attention mask
-            attention_mask[i, :seq_len] = True
-
-            # Store center cell type label
-            center_cell_type = region['center_cell_type']
-            cell_type_labels[i] = cell_type_to_idx.get(center_cell_type, 0)
-
-        return (original_embeddings, masked_embeddings, coordinates,
-                attention_mask, cell_type_labels, mask_info)
-
-    def forward(self, batch_data, cell_type_to_idx, task='all'):
+    def forward(self, batch_data):
         """
         Forward pass with intensity-level masking
         """
         # Create embeddings with masking applied
-        (original_embeddings, masked_embeddings, coordinates,
-         attention_mask, cell_type_labels, mask_info) = self.create_embeddings_with_masking(
-            batch_data, cell_type_to_idx
-        )
+        embeddings, coordinates, pad_mask, masked_biomarker_expression = \
+            self.create_embeddings(batch_data)
 
-        # Project embeddings to model dimension
-        original_projected = self.embedder_projection(original_embeddings)
-        masked_projected = self.embedder_projection(masked_embeddings)
+        results = {}
 
-        # Add positional embeddings
-        pos_embed = self.pos_embedding(coordinates)
-        original_projected = original_projected + pos_embed
-        masked_projected = masked_projected + pos_embed
+        x = self.embedder_projection(embeddings)
+        x = x + self.pos_embedding(coordinates)
+        x = self.input_norm(x)
+        x = self.encoder(x, src_key_padding_mask=pad_mask)
+        center_encoded = x[:, 0]
+        results['center_encoded'] = center_encoded
 
-        # Create padding mask for attention
-        src_key_padding_mask = ~attention_mask
-
-        results = {
-            'cell_type_labels': cell_type_labels,
-            'mask_info': mask_info,
-            'masking_stats': self.intensity_masker.get_masking_statistics(mask_info)
-        }
-
-        # Masked intensity prediction task
-        if task in ['mask_prediction', 'all']:
-            # Use masked embeddings for encoding
-            encoded = self.encoder(masked_projected, src_key_padding_mask=src_key_padding_mask)
-
-            # Use decoder to predict center cell
-            batch_size = masked_embeddings.shape[0]
-            center_queries = self.center_query.expand(batch_size, -1, -1)
-
-            decoded_center = self.decoder(
-                center_queries,
-                encoded,
-                memory_key_padding_mask=src_key_padding_mask
-            )
-
-            # Predict original center cell embedding
-            mask_predictions = self.mask_prediction_head(decoded_center.squeeze(1))
-
-            results['mask_predictions'] = mask_predictions
-            results['mask_targets'] = original_embeddings[:, 0]  # Original center cell embeddings
-
-        # Cell type prediction
-        if task in ['celltype', 'all']:
-            # Use original embeddings for cell type prediction, but mask center cell
-            celltype_embeddings = original_projected.clone()
-            celltype_embeddings[:, 0] = 0  # Completely mask center cell
-
-            encoded_celltype = self.encoder(celltype_embeddings, src_key_padding_mask=src_key_padding_mask)
-
-            # Average neighbor embeddings (exclude center cell)
-            neighbor_embeddings = encoded_celltype[:, 1:, :]
-            neighbor_mask = attention_mask[:, 1:]
-
-            if neighbor_mask.any():
-                neighbor_embeddings_masked = neighbor_embeddings * neighbor_mask.unsqueeze(-1).float()
-                neighbor_sum = neighbor_embeddings_masked.sum(dim=1)
-                neighbor_count = neighbor_mask.sum(dim=1, keepdim=True).float().clamp(min=1)
-                neighbor_avg = neighbor_sum / neighbor_count
+        if not self.is_teacher_model:
+            # reconstruction task implementation
+            if self.config.spec_index_recon:
+                results.update(self._perform_spec_batch_reconstruction(
+                    center_encoded, batch_data))
             else:
-                neighbor_avg = torch.zeros(batch_size, self.config.d_model, device=self.config.device)
-
-            celltype_logits = self.celltype_classifier(neighbor_avg)
-            results['celltype_logits'] = celltype_logits
-
-        # Reconstruction task
-        if task in ['reconstruction', 'all']:
-            # Use original embeddings for reconstruction
-            encoded_recon = self.encoder(original_projected, src_key_padding_mask=src_key_padding_mask)
-
-            batch_size = original_embeddings.shape[0]
-            center_queries = self.center_query.expand(batch_size, -1, -1)
-
-            decoded_center = self.decoder(
-                center_queries,
-                encoded_recon,
-                memory_key_padding_mask=src_key_padding_mask
-            )
-
-            reconstruction = self.reconstruction_head(decoded_center.squeeze(1))
-            results['reconstruction'] = reconstruction
-            results['reconstruction_targets'] = original_embeddings[:, 0]
+                results.update(self._perform_batch_reconstruction(
+                    center_encoded, batch_data, masked_biomarker_expression))
 
         return results
+
+    def _perform_batch_reconstruction(self, center_encoded, batch_data, masked_biomarker_expression):
+        """
+        Perform reconstruction for all masked biomarkers across the entire batch
+
+        Args:
+            center_encoded: (batch_size, d_model) - encoded center cells
+            batch_data: original batch data
+            masked_biomarker_expression: list of dicts with masked biomarker info for each sample
+
+        Returns:
+            Dictionary with reconstruction targets and predictions
+        """
+
+        recon_biomarker_names = []
+        recon_sample_indices = []
+        recon_targets = []
+        target_descs = []
+
+        for sample_idx, (sample_data, masked_items) in enumerate(zip(batch_data, masked_biomarker_expression)):
+            for biomarker_name, intensity in masked_items.items():
+                recon_biomarker_names.append(biomarker_name)
+                recon_sample_indices.append(sample_idx)
+                recon_targets.append(intensity)
+                target_descs.append((
+                    sample_data['study_name'],
+                    sample_data['region_name'],
+                    sample_data['original_center_idx'],
+                    biomarker_name,
+                    intensity
+                ))
+
+        if len(recon_targets) == 0:
+            return {'recon_targets': torch.tensor([], device=self.config.device),
+                    'recon_results': torch.tensor([], device=self.config.device),
+                    'target_descs': target_descs}
+
+        recon_sample_indices = torch.tensor(recon_sample_indices, device=self.config.device, dtype=torch.long)
+        recon_center_encodings = center_encoded[recon_sample_indices]  # (num_recon, d_model)
+        recon_biomarker_embs = self.biomarker_embedder.get_batched_embeddings(recon_biomarker_names)  # (num_recon, biomarker_dim)
+
+        recon_targets = torch.tensor(recon_targets, dtype=torch.float32, device=self.config.device)
+        recon_inputs = torch.cat([recon_center_encodings, recon_biomarker_embs], dim=-1)  # (num_recon, d_model + biomarker_dim)
+        recon_results = self.reconstruction_head(recon_inputs).squeeze(-1)
+        return {'recon_target': recon_targets,
+                'recon_results': recon_results,
+                'target_descs': target_descs}
+
+    # def _perform_spec_batch_reconstruction(self, center_encoded, batch_data):
+    #     """
+    #     Perform reconstruction for all masked biomarkers across the entire batch
+
+    #     Args:
+    #         center_encoded: (batch_size, d_model) - encoded center cells
+    #         batch_data: original batch data
+
+    #     Returns:
+    #         Dictionary with reconstruction targets and predictions
+    #     """
+    #     target_biomarker = "PanCK"
+    #     all_targets = []
+    #     # if target_biomarker not in batch_data[0]:
+    #     #     return {
+    #     #         'recon_target': [],
+    #     #         'recon_results': []
+    #     #     }
+    #     for sample_data in batch_data:
+    #         center_idx = 0
+    #         center_target_biomarker_index = sample_data['biomarkers'].index(target_biomarker)
+    #         center_target_biomarker_val = sample_data['intensities'][center_idx, center_target_biomarker_index]
+    #         all_targets.append(center_target_biomarker_val)
+    #     all_targets = torch.tensor(all_targets, dtype=torch.float32, device=self.config.device)
+
+    #     # Use a zero placeholder for biomarker embedding
+    #     bm_emb_input = torch.zeros((len(batch_data), self.biomarker_dim), device=self.config.device)
+    #     recon_inputs = torch.concat([center_encoded, bm_emb_input], dim=-1)
+    #     all_preds = self.reconstruction_head(recon_inputs).squeeze(-1)
+
+    #     if np.random.rand() < 0.02:
+    #         print(f"Target stats: mean={all_targets.mean():.4f}, std={all_targets.std():.4f}")
+    #         print(f"Prediction stats: mean={all_preds.mean():.4f}, std={all_preds.std():.4f}")
+    #         print(f"Sample targets: {all_targets[:5]}")
+    #         print(f"Sample predictions: {all_preds[:5]}")
+
+    #     return {
+    #         'recon_target': all_targets,
+    #         'recon_results': all_preds,
+    #     }
+    
+    def freeze_backbone(self):
+        """Freeze all parameters except celltype_head"""
+        for name, param in self.named_parameters():
+            if 'celltype_head' not in name:
+                param.requires_grad = False
+    
+    def unfreeze_backbone(self):
+        """Unfreeze all parameters"""
+        for param in self.parameters():
+            param.requires_grad = True

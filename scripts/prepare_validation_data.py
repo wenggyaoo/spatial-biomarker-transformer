@@ -93,5 +93,5 @@ def print_data_summary(data_path):
 
 
 if __name__ == "__main__":
-    data_path = r'C:\Users\alexk\PycharmProjects\Model_v1\.venv\data'  # Change this to your data path
+    data_path = r"/autofs/bal14/khguo/data_celltype"  # Change this to your data path
     split_data_for_validation(data_path, val_split=0.2)
