@@ -56,6 +56,10 @@ venv.bak/
 ehthumbs.db
 Thumbs.db
 
+# Local generated folders
+/figures/
+/.mplconfig/
+
 # Project specific
 /data/
 /models/
