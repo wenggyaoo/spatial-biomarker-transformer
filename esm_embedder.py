@@ -193,9 +193,22 @@ class BiomarkerEmbedder(nn.Module):
         """Build learnable embeddings."""
         print("Building learnable embeddings...")
         for biomarker_name in all_biomarkers:
+<<<<<<< HEAD
             embedding = self._create_learnable_fallback_embedding(biomarker_name)
             safe_name = self._sanitize_name(biomarker_name)
             self.register_parameter(f"emb:{safe_name}", embedding)
+=======
+            # Apply the same mapping as forward() so vocab keys are canonical names.
+            # DEBUG: without this, names like 'CD49f' map to 'CD49' at lookup time but would be stored under 'CD49f', causing a KeyError.
+            canonical_name = self.biomarker_mapping.get(biomarker_name, biomarker_name)
+            if canonical_name == "EMPTY":
+                continue
+            safe_name = self._sanitize_name(canonical_name)
+            if safe_name in self.biomarker_embeddings:
+                continue  # multiple originals (CD49f, CD49d, …) share one canonical
+            embedding = self._create_learnable_fallback_embedding(canonical_name)
+            self.register_parameter(f"emb__{safe_name}", embedding)
+>>>>>>> 6aef426 (try implementations)
             self.biomarker_embeddings[safe_name] = embedding
 
     def _create_learnable_fallback_embedding(self, biomarker_name: str) -> torch.Tensor:
